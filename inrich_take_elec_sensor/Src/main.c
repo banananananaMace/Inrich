@@ -1,0 +1,222 @@
+#include <string.h>
+#include "main.h"
+#include "stm32l4xx_hal.h"
+#include "sx1280_app.h"
+#include "hw.h"
+#include "radio.h"
+#include "sx1280.h"
+#include "protocol.h"
+#include "flash.h"
+#include "usart.h"
+#include "adc.h"
+#include "rtc.h"
+#include "rng.h"
+#include "iwdg.h"
+
+#define start_up_time 0 //(调整值)
+#define MODE_LORA
+#define RX_TIMEOUT_TICK_SIZE RADIO_TICK_SIZE_1000_US
+#define REPEAT_TIMES 0    //第一次唤醒赋值
+//#define FLASH_OTP_ADDR          ((uint32_t)0x1FFF7000)
+uint32_t Repeat_Count=0;      //唤醒次数
+uint64_t sensor_id=0 ;
+uint8_t otp_sensor_id_buf[6]= {0};
+uint8_t sensor_id_buf[6]= {0xA9,0x2E,0x08,0x2B,0xFF,0x00};
+
+SPI_HandleTypeDef hspi1;
+HAL_StatusTypeDef hi2c1_status;
+RTC_HandleTypeDef RTCHandle;
+
+uint8_t Buffer[10]= {0x00};
+uint8_t WriteBuffer[10],ReadBuffer[10];
+uint32_t One_Cycle=0;
+float Shift_time=0.0;
+
+uint8_t Send_BURST_Count=1;//重复发送BURST次数定义
+uint8_t Send_Frame_Type=0;
+uint8_t Send_BURST_Flag=0;
+uint16_t Rssi=0;        //信号强度
+uint8_t Receive_flag=0;
+uint8_t Receive_RSP_End_OK_flag=0;
+volatile uint32_t MainRun_Time=0;//偏移时间 ms单位 计算程序运行时间
+uint32_t sx1280_receive_time=0;//在倒计时处理地方进行赋值递减。
+uint32_t  Sample_Interval=0;
+float  temperatrue=0;
+int16_t TEMP=0;
+uint8_t   wake_up_flag=0;
+uint32_t   while_count=0;
+uint8_t Ackbuff[10]= {0x00};
+uint8_t Burst_Status=0;
+
+PacketParams_t packetParams;
+PacketStatus_t packetStatus;
+
+void TMP102_SensorData( void );
+uint32_t Handle_RFSendflag(void);
+void Enter_ShutDown_Mode(void);
+uint64_t default_sensor_id=0;
+extern uint32_t Flash_Sensor_ID;
+uint32_t sensor_sleep_time=0;
+int main( void )
+{
+    HwInit( );
+    Read_flash_Parameter();//读取参数
+    memcpy(&sensor_id_buf[2],&Flash_Sensor_ID,4);
+    memcpy(&default_sensor_id,sensor_id_buf,6);
+    FrstGpioInit();
+//    MX_IWDG_Init();
+    while(1)
+    {
+        MainRun_Time=0;
+        Send_Frame_Type=0;
+        AppState=APP_LOWPOWER;
+        WhileGpioInit( );
+        SpiInit( );
+        MX_I2C1_Init();
+        RTC_Config();
+        Wakeup_Source_Handle();
+        __HAL_RCC_CLEAR_RESET_FLAGS();
+        SX1280_Init(Frequency_list[Frequency_point]);
+        Battery_Voltage_Measure();
+        TMP102_SensorData();
+        Handle_RFSendflag();
+        HAL_IWDG_Refresh(&hiwdg);
+        Enter_ShutDown_Mode();
+    }
+}
+
+
+void TMP102_SensorData( void )
+{
+
+    WriteBuffer[0] =  0x01;//配置寄存器
+    WriteBuffer[1] =  0xE1;//单次采样，采样后关闭，12位ADC
+    WriteBuffer[2] =  0xA0;//4hz采样默认速度
+    HAL_I2C_Master_Transmit(&hi2c1, TMP101_Add_Write,WriteBuffer,3,0xffff);
+    WriteBuffer[0]=0;
+    HAL_I2C_Master_Transmit(&hi2c1, TMP101_Add_Write,WriteBuffer,1,0xffff);
+    HAL_I2C_Master_Receive(&hi2c1, TMP101_Add_Read,ReadBuffer,2,0xffff);
+
+    TEMP = (ReadBuffer[0] << 8) + ReadBuffer[1];
+    temperatrue = TEMP;
+    temperatrue = temperatrue/16;
+    temperatrue = temperatrue*0.0625;//温度保留两位小数;
+    if (temperatrue > Alarm_threshold)
+    {
+        Burst_Status=HAL_RTCEx_BKUPRead(&RTCHandle,RTC_BKP_DR20);
+        if(Burst_Status == 1) //之前状态是告警帧,不发送告警帧
+        {
+            Send_BURST_Flag = 0;
+        }
+        else
+        {
+            Send_BURST_Flag = 1;
+            HAL_RTCEx_BKUPWrite(&RTCHandle, RTC_BKP_DR20, 1); //设备告警状态标志位
+        }
+        if(Send_Frame_Type == 1)//在发送Message时如果产生告警，则不发送message
+        {
+            Send_BURST_Flag = 1;
+            Send_Frame_Type = 0;
+        }
+        if(Send_Frame_Type == 2)//在发REQ如果产生告警，发REQ和BURST
+        {
+            Send_BURST_Flag = 1;
+        }
+    }
+    else
+    {
+        HAL_RTCEx_BKUPWrite(&RTCHandle,RTC_BKP_DR20,0);
+    }
+    memcpy(Buffer,&temperatrue,4);
+}
+
+uint32_t Handle_RFSendflag(void)
+{
+    if(b<3000)//电源电压值下限
+    {
+        Send_Frame_Type=0;
+        Send_BURST_Flag=0;
+    }
+    if(Send_BURST_Flag==1)
+    {
+        Radio.SetRfFrequency(Frequency_list[1]);//控制频点
+        Send_BURST_Flag=0;
+        AppState=0;
+        Send_BURST_Count=2;
+        while(Send_BURST_Count)
+        {
+            SendtoStation_sx1280_frame(BURST,15,Temperature_type,Buffer);
+            HAL_Delay( 40 );
+            Send_BURST_Count--;
+        }//Send_BURST_Count 重复发送次数
+    }//BURST帧处理
+    if(Send_Frame_Type == 1)
+    {
+        Send_Frame_Type=0;
+        SendtoStation_sx1280_frame(MESSAGE,15,Temperature_type,Buffer);
+        HAL_Delay( 35 );
+        Get_random();
+    }
+    else if( Send_Frame_Type == 2)
+    {
+        Send_Frame_Type=0;
+        AppState=0;
+        Radio.SetRfFrequency(Frequency_list[1]);//切换控制频点
+        SendtoStation_sx1280_frame(REQ,2,Temperature_type,Buffer);
+        HAL_Delay( 13 );
+        sx1280_receive_time=70;
+        while(sx1280_receive_time)
+        {
+            if( IrqState ==true)
+            {
+                SX1280ProcessIrqs();//扫描各类状态，例如发送和接收，则置AppState为对应变量，然后通过下面代码处理数据
+                IrqState =false;
+            }
+            if(Process_Appstate_0()==APP_RX)
+            {
+                if(Handle_receiveStation_sx1280_frame()==RSP_END)
+                {
+                    Receive_RSP_End_OK_flag=0;
+                    Ackbuff[0]=1;
+                    SendtoStation_sx1280_frame(ACK,1,RSP_END_ACK_type,Ackbuff);
+                    HAL_Delay( 30 );
+                    break;
+                }
+            }
+        }
+    }
+    Radio.SetStandby( STDBY_RC );
+    SX1280_Enter_LowPower();
+    return 0;
+}
+
+void Enter_ShutDown_Mode(void)
+{
+    wake_up_flag=1;
+    HAL_RTCEx_DeactivateWakeUpTimer(&RTCHandle);
+    sensor_sleep_time=Message_cycle-1;
+    HAL_RTCEx_SetWakeUpTimer_IT(&RTCHandle, sensor_sleep_time, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+    SpiDeInit();
+    HAL_I2C_DeInit(&hi2c1);   //写到串口上io口？
+    HAL_ADC_DeInit(&hadc1);
+    GpioDeInit();
+    HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+}
+
+
+
+
+
+//void Enter_ShutDown_Mode(void)
+//{
+//    wake_up_flag=1;
+//    HAL_RTCEx_DeactivateWakeUpTimer(&RTCHandle);
+//    Sample_Interval=(Sample_Interval-((MainRun_Time)*2.048+start_up_time)+1);//5是估算程序启动时间 2是计算ms
+//    HAL_RTCEx_SetWakeUpTimer_IT(&RTCHandle, Sample_Interval, RTC_WAKEUPCLOCK_RTCCLK_DIV16);
+//    SpiDeInit();
+//    HAL_I2C_DeInit(&hi2c1);   //写到串口上io口？
+//    HAL_ADC_DeInit(&hadc1);
+//    GpioDeInit();
+//    HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+
+//}
